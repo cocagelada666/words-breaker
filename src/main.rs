@@ -4,11 +4,13 @@ use bitcoin::address::{Address, NetworkChecked, NetworkUnchecked};
 use bitcoin::bip39::{DerivationPath, Xpriv};
 use bitcoin::{Network, PublicKey};
 use clap::Parser;
-use itertools::Itertools;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
-#[command(about = "Try permutations of 12 BIP-39 words to match a BTC legacy address", version)]
+#[command(
+    about = "Try permutations of 12 BIP-39 words to match a BTC legacy address",
+    version
+)]
 struct Args {
     /// Target legacy Bitcoin address (Base58, starting with '1')
     target_address: String,
@@ -16,11 +18,11 @@ struct Args {
     /// Exactly 12 words (unordered or partially ordered)
     words: Vec<String>,
 
-    /// Maximum number of permutations to test (to avoid 12! by default)
+    /// Maximum number of permutations to test
     #[arg(long, default_value_t = 1_000_000)]
     max_permutations: usize,
 
-    /// BIP-39 wordlist language (english, portuguese, spanish, french, italian, czech, korean, japanese, chinese-simplified, chinese-traditional)
+    /// BIP-39 wordlist language
     #[arg(long, short, default_value = "english")]
     language: String,
 }
@@ -39,17 +41,27 @@ fn main() -> Result<()> {
 
     let target_address: Address<NetworkChecked> = target_address_unchecked
         .require_network(Network::Bitcoin.into())
-        .context("This tool currently only supports mainnet legacy addresses")?;
+        .context("Only mainnet legacy addresses supported")?;
+
+    let mut words = args.words.clone();
 
     let start = Instant::now();
     let language = parse_language(&args.language)?;
-    let found = search_permutations(&args.words, &target_address, args.max_permutations, language)?;
+
+    let found = search_permutations(
+        &mut words,
+        &target_address,
+        args.max_permutations,
+        language,
+    )?;
+
     let elapsed = start.elapsed();
 
     if !found {
         println!(
-            "No matching mnemonic found within the first {} permutations (elapsed: {:?})",
-            format_number(args.max_permutations), elapsed
+            "No match found in {} permutations (elapsed: {:?})",
+            format_number(args.max_permutations),
+            elapsed
         );
     }
 
@@ -80,50 +92,90 @@ fn parse_language(lang: &str) -> Result<Language> {
         "japanese" => Ok(Language::Japanese),
         "chinese-simplified" => Ok(Language::SimplifiedChinese),
         "chinese-traditional" => Ok(Language::TraditionalChinese),
-        _ => anyhow::bail!("Unknown language: {}. Supported: english, portuguese, spanish, french, italian, czech, korean, japanese, chinese-simplified, chinese-traditional", lang),
+        _ => anyhow::bail!("Unknown language: {}", lang),
     }
 }
 
 fn search_permutations(
-    words: &[String],
+    words: &mut [String],
     target: &Address<NetworkChecked>,
     max_permutations: usize,
     language: Language,
 ) -> Result<bool> {
     let derivation_path: DerivationPath = "m/44'/0'/0'/0/0".parse()?;
-
     let secp = bitcoin::secp256k1::Secp256k1::new();
 
-    for (i, perm) in words.iter().cloned().permutations(words.len()).take(max_permutations).enumerate() {
-        if i % 100000 == 0 && i > 0 {
-            println!("Checked {} permutations...", format_number(i));
+    let mut count = 0;
+    let mut c = vec![0; words.len()];
+
+    // primeira permutação
+    if check(words, target, &secp, &derivation_path, language, count)? {
+        return Ok(true);
+    }
+    count += 1;
+
+    let mut i = 0;
+    while i < words.len() {
+        if count >= max_permutations {
+            break;
         }
 
-        let phrase = perm.join(" ");
+        if c[i] < i {
+            if i % 2 == 0 {
+                words.swap(0, i);
+            } else {
+                words.swap(c[i], i);
+            }
 
-        let mnemonic = match Mnemonic::parse_in_normalized(language, &phrase) {
-            Ok(m) => m,
-            Err(_) => continue, // skip invalid mnemonics
-        };
+            if count % 100000 == 0 && count > 0 {
+                println!("Checked {} permutations...", format_number(count));
+            }
 
-        let seed = mnemonic.to_seed("");
+            if check(words, target, &secp, &derivation_path, language, count)? {
+                return Ok(true);
+            }
 
-        let master_xprv = Xpriv::new_master(Network::Bitcoin, &seed)
-            .context("Failed to create master xprv")?;
-
-        let child_xprv = master_xprv.derive_priv(&secp, &derivation_path)?;
-
-        let child_priv = child_xprv.private_key;
-        let child_pub = PublicKey::new(child_priv.public_key(&secp));
-
-        let addr: Address<NetworkChecked> = Address::p2pkh(&child_pub, Network::Bitcoin);
-
-        if &addr == target {
-            println!("Found matching mnemonic: {}", phrase);
-            println!("Permutation index (0-based within search): {}", i);
-            println!("Derived address: {}", addr);
-            return Ok(true);
+            count += 1;
+            c[i] += 1;
+            i = 0;
+        } else {
+            c[i] = 0;
+            i += 1;
         }
+    }
+
+    Ok(false)
+}
+
+fn check(
+    words: &[String],
+    target: &Address<NetworkChecked>,
+    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+    derivation_path: &DerivationPath,
+    language: Language,
+    index: usize,
+) -> Result<bool> {
+    let phrase = words.join(" ");
+
+    let mnemonic = match Mnemonic::parse_in_normalized(language, &phrase) {
+        Ok(m) => m,
+        Err(_) => return Ok(false),
+    };
+
+    let seed = mnemonic.to_seed("");
+
+    let master_xprv = Xpriv::new_master(Network::Bitcoin, &seed)?;
+    let child_xprv = master_xprv.derive_priv(secp, derivation_path)?;
+
+    let child_pub = PublicKey::new(child_xprv.private_key.public_key(secp));
+    let addr = Address::p2pkh(&child_pub, Network::Bitcoin);
+
+    if &addr == target {
+        println!("\n🎉 FOUND MATCH!");
+        println!("Mnemonic: {}", phrase);
+        println!("Index: {}", index);
+        println!("Address: {}", addr);
+        return Ok(true);
     }
 
     Ok(false)
