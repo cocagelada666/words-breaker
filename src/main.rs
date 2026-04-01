@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bip39::{Language, Mnemonic};
 use bitcoin::address::{Address, NetworkChecked, NetworkUnchecked};
-use bitcoin::bip32::{DerivationPath, Xpriv};
+use bitcoin::bip39::{DerivationPath, Xpriv};
 use bitcoin::{Network, PublicKey};
 use clap::Parser;
 use itertools::Itertools;
